@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# launcher wrapper: execute the built binary in build/ if present
+BASEDIR="$(cd "$(dirname "$0")" && pwd)"
+BIN="$BASEDIR/build/atr_mina"
+if [ -x "$BIN" ]; then
+  exec "$BIN" "$@"
+else
+  echo "atr_mina: binary not found or not executable at $BIN" >&2
+  echo "Try: (cd $BASEDIR && mkdir -p build && cd build && cmake .. && make)" >&2
+  exit 1
+fi

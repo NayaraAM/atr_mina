@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  # 1. Broker MQTT (O único que precisa ser acessível de fora)
+  atr_mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: atr_mosquitto
+    ports:
+      # Porta Padrão MQTT (Essencial para o Python conectar)
+      - "1883:1883"
+      # Porta Websocket (Pode remover se não for usar navegador/web)
+      # - "9001:9001" 
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+    restart: unless-stopped
+
+  # 2. Aplicação C++ (Cliente interno)
+  atr_mina_app:
+    build: .
+    container_name: atr_mina_app
+    depends_on:
+      - atr_mosquitto
+    environment:
+      - MQTT_BROKER=atr_mosquitto
+      - MQTT_PORT=1883
+    # SEM "ports:" AQUI! O C++ não precisa receber conexões de fora.
+    volumes:
+      - ./logs:/workspace/logs
+      - ./routes:/workspace/routes
+    command: ./build/atr_mina
+    restart: on-failure

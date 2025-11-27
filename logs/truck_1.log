@@ -1,0 +1,26 @@
+=========================================
+     Sistema ATR - Caminhão Autônomo     
+=========================================
+[MQTT] Rodando em modo MOCK (sem conexão ao broker).
+[MAIN] MQTT inicializado.
+[MAIN] Arquivo de rota não existe ('routes/example.route'), continuando sem rota.
+[MQTT] Erro ao assinar tópico /mina/caminhoes/1/comandos: MQTT error [-3]: Disconnected
+[MQTT] Erro ao assinar tópico /mina/caminhoes/1/setpoints: MQTT error [-3]: Disconnected
+[MQTT] Erro ao assinar tópico /mina/caminhoes/1/sim/defeito: MQTT error [-3]: Disconnected
+[MAIN] Iniciando threads...
+[MAIN] Todas as threads iniciadas.
+[MAIN] Pressione Ctrl+C para encerrar.
+[MQTT] Erro ao assinar tópico /mina/gerente/add_truck: MQTT error [-3]: Disconnected
+=========================================
+     Sistema ATR - Caminhão Autônomo     
+=========================================
+[MQTT] Rodando em modo MOCK (sem conexão ao broker).
+[MAIN] MQTT inicializado.
+[MAIN] Arquivo de rota não existe ('routes/example.route'), continuando sem rota.
+[MQTT] Erro ao assinar tópico /mina/caminhoes/1/comandos: MQTT error [-3]: Disconnected
+[MQTT] Erro ao assinar tópico /mina/caminhoes/1/setpoints: MQTT error [-3]: Disconnected
+[MQTT] Erro ao assinar tópico /mina/caminhoes/1/sim/defeito: MQTT error [-3]: Disconnected
+[MAIN] Iniciando threads...
+[MAIN] Todas as threads iniciadas.
+[MAIN] Pressione Ctrl+C para encerrar.
+[MQTT] Erro ao assinar tópico /mina/gerente/add_truck: MQTT error [-3]: Disconnected

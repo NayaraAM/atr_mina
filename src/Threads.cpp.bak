@@ -1,0 +1,533 @@
+// src/Threads.cpp
+// Versão completa integrada com Autuadores (Estados / Comandos / Atuadores),
+// Simulação da Mina, Controle (manual/automático), Monitoramento de falhas,
+// Coletor de dados (formato Tabela 3) e publicação MQTT.
+//
+// Substitua src/Threads.cpp pelo conteúdo abaixo.
+// Requer as headers: Threads.h, Autuadores.h, Sensores.h, SensorData.h, BufferCircular.h, MqttClient.h
+
+#include "Threads.h"
+#include "Autuadores.h"
+#include "Sensores.h"
+#include "SensorData.h"
+#include "BufferCircular.h"
+#include "MqttClient.h"
+
+#include <thread>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <random>
+#include <cmath>
+#include <string>
+
+using namespace std::chrono_literals;
+using namespace std;
+
+static int64_t now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// ------------------------------
+// Helper: safe string -> int
+// ------------------------------
+static bool extract_int_arg(const string &s, const string &key, int &out) {
+    auto pos = s.find(key);
+    if (pos == string::npos) return false;
+    // try formats: "x=123" or "\"x\":123" or "\"x\": 123
+    size_t eq = s.find('=', pos);
+    size_t colon = s.find(':', pos);
+    size_t start = string::npos;
+    if (eq != string::npos) start = eq + 1;
+    else if (colon != string::npos) start = colon + 1;
+    else return false;
+    // skip spaces
+    while (start < s.size() && isspace((unsigned char)s[start])) ++start;
+    // read number (allow -)
+    size_t i = start;
+    if (i < s.size() && (s[i] == '-' || s[i] == '+')) ++i;
+    while (i < s.size() && isdigit((unsigned char)s[i])) ++i;
+    if (i == start) return false;
+    try {
+        out = stoi(s.substr(start, i-start));
+        return true;
+    } catch(...) { return false; }
+}
+
+// ------------------------------
+// THREAD 1: TratamentoSensores + Simulação da Mina
+// - Esta thread simula a física do caminhão (posição/ângulo) a partir dos atuadores,
+//   aplica ruído e filtra com Sensores (média móvel).
+// - Publica "/mina/caminhoes/<id>/sensores" com JSON {x,y,ang,temp}
+// ------------------------------
+void TratamentoSensores_thread(
+    atomic<bool>& stop_flag,
+    BufferCircular<SensorData>& buf_nav,
+    BufferCircular<SensorData>& buf_logic,
+    BufferCircular<SensorData>& buf_falhas,
+    BufferCircular<SensorData>& buf_coletor,
+    MqttClient& mqtt,
+    EstadosCaminhao& estados,
+    ComandosCaminhao& comandos,
+    AtuadoresCaminhao& atuadores,
+    int ordem_media_movel,
+    int periodo_ms,
+    int truck_id
+) {
+    Sensores filtro(ordem_media_movel);
+
+    // RNG para ruído
+    std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
+    std::normal_distribution<double> noise_pos(0.0, 0.8);   // ruído de posição
+    std::normal_distribution<double> noise_ang(0.0, 1.0);   // ruído de ângulo
+    std::normal_distribution<double> noise_temp(0.0, 2.0);  // ruído temperatura
+    std::bernoulli_distribution falha_dist(0.0); // não usamos distrib. aleatória p/ falha aqui
+
+    // estado simulado interno (world coords 0..1000)
+    double px = 500.0, py = 500.0;
+    double heading = 0.0; // graus, 0..360 (leste=0)
+    double velocity = 0.0; // unidades arbitrárias (px / segundo)
+    double last_time = (double)now_ms();
+
+    while (!stop_flag.load()) {
+        double tnow = (double)now_ms();
+        double dt_ms = tnow - last_time;
+        if (dt_ms < 1.0) dt_ms = periodo_ms;
+        double dt = dt_ms / 1000.0;
+        last_time = tnow;
+
+        // read actuators snapshot
+        int o_acel = atuadores.o_aceleracao.load(); // -100..100
+        int o_dir  = atuadores.o_direcao.load();    // -180..180
+
+        // convert accel % to acceleration units (tunable)
+        double accel = static_cast<double>(o_acel) * 0.5; // px/s^2 per percent
+        // update velocity
+        velocity += accel * dt;
+        // clamp velocity
+        if (velocity > 200.0) velocity = 200.0;
+        if (velocity < -50.0) velocity = -50.0;
+
+        // smooth heading toward desired direction (o_dir is absolute desired heading)
+        double desired_heading = static_cast<double>(o_dir);
+        // normalize both to -180..180 for shortest turn
+        auto norm = [](double a) {
+            while (a > 180.0) a -= 360.0;
+            while (a <= -180.0) a += 360.0;
+            return a;
+        };
+        double hdg_err = norm(desired_heading - heading);
+        // rate of heading change (deg/s) proportional to heading error (tunable)
+        double hdg_rate = hdg_err * 2.0; // deg/s per deg error
+        // apply small limit
+        if (hdg_rate > 90.0) hdg_rate = 90.0;
+        if (hdg_rate < -90.0) hdg_rate = -90.0;
+        heading += hdg_rate * dt;
+        heading = fmod(heading, 360.0);
+        if (heading < 0.0) heading += 360.0;
+
+        // update position
+        double rad = heading * M_PI / 180.0;
+        px += velocity * cos(rad) * dt;
+        py += velocity * sin(rad) * dt;
+
+        // clamp into world [0,1000]
+        if (px < 0.0) px = 0.0;
+        if (px > 1000.0) px = 1000.0;
+        if (py < 0.0) py = 0.0;
+        if (py > 1000.0) py = 1000.0;
+
+        // generate SensorData with noise
+        SensorData raw;
+        raw.timestamp_ms = static_cast<uint64_t>(now_ms());
+        raw.i_posicao_x = static_cast<int>(std::round(px + noise_pos(rng)));
+        raw.i_posicao_y = static_cast<int>(std::round(py + noise_pos(rng)));
+        raw.i_angulo_x = static_cast<int>(std::round(fmod(heading + noise_ang(rng) + 360.0, 360.0)));
+        // temperature: base depends on accel/velocity (simple model)
+        double base_temp = 70.0 + std::max(0.0, velocity*0.05) + std::abs(accel)*0.02;
+        raw.i_temperatura = static_cast<int>(std::round(base_temp + noise_temp(rng)));
+        // falhas somente por Monitoramento ou interface (não aleatórias aqui)
+        raw.i_falha_eletrica = false;
+        raw.i_falha_hidraulica = false;
+
+        // apply filtro (média móvel)
+        SensorData tratado = filtro.filtrar(raw);
+
+        // push para buffers
+        buf_nav.push(tratado);
+        buf_logic.push(tratado);
+        buf_falhas.push(tratado);
+        buf_coletor.push(tratado);
+
+        // publish sensores
+        std::ostringstream ss;
+        ss << "{"
+           << "\"x\":" << tratado.i_posicao_x << ","
+           << "\"y\":" << tratado.i_posicao_y << ","
+           << "\"ang\":" << tratado.i_angulo_x << ","
+           << "\"temp\":" << tratado.i_temperatura
+           << "}";
+        std::string topic = "/mina/caminhoes/" + std::to_string(truck_id) + "/sensores";
+        mqtt.publish(topic, ss.str());
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(periodo_ms));
+    }
+}
+
+
+// ------------------------------
+// THREAD 2: Lógica de Comando
+// - lê comandos MQTT e set/limpa flags em ComandosCaminhao e EstadosCaminhao
+// - reseta comandos de pulso quando apropriado
+// ------------------------------
+void LogicaDeComando_thread(
+    atomic<bool>& stop_flag,
+    BufferCircular<SensorData>& buf_logic,
+    MqttClient& mqtt,
+    EstadosCaminhao& estados,
+    ComandosCaminhao& comandos,
+    AtuadoresCaminhao& atuadores,
+    int truck_id
+) {
+    std::string topic_cmd = "/mina/caminhoes/" + std::to_string(truck_id) + "/comandos";
+
+    while (!stop_flag.load()) {
+        // try consume latest sensor (non-block)
+        SensorData sd;
+        buf_logic.try_pop(sd); // not required to use here; logic may use latest buffer
+
+        // check MQTT for commands
+        auto maybe = mqtt.try_pop_message(topic_cmd);
+        if (maybe) {
+            std::string pl = *maybe;
+            // Interpret common command formats:
+            // JSON-like: {"c_man":true}
+            // key=value: "c_man=1" or "x=123,y=456"
+            // raw tokens: "MAN", "AUTO", "REARME", "ACELERA_ON", "ACELERA_OFF", "DIR_ON", "DIR_OFF", "ESQ_ON", "ESQ_OFF"
+
+            std::string s = pl;
+            // normalize to lowercase for tokens detection
+            std::string low = s;
+            for (auto &c : low) c = std::tolower((unsigned char)c);
+
+            // modo manual / automatico
+            if (low.find("c_man") != std::string::npos || low.find("man") != std::string::npos) {
+                comandos.c_man.store(true);
+                estados.e_automatico.store(false);
+            }
+            if (low.find("c_automatico") != std::string::npos || low.find("auto") != std::string::npos) {
+                comandos.c_automatico.store(true);
+                estados.e_automatico.store(true);
+            }
+
+            // rearme
+            if (low.find("c_rearme") != std::string::npos || low.find("rearme") != std::string::npos) {
+                comandos.c_rearme.store(true);
+                // if rearme requested: clear defect state
+                estados.e_defeito.store(false);
+            }
+
+            // acelera ON/OFF
+            if (low.find("c_acelera") != std::string::npos || low.find("acelera") != std::string::npos) {
+                // check for explicit on/off
+                if (low.find("true") != string::npos || low.find("on") != string::npos || low.find("1") != string::npos)
+                    comandos.c_acelera.store(true);
+                else
+                    comandos.c_acelera.store(false);
+            }
+
+            // direita / esquerda
+            if (low.find("c_direita") != std::string::npos || low.find("direita") != std::string::npos) {
+                if (low.find("true") != string::npos || low.find("on") != string::npos || low.find("1") != string::npos)
+                    comandos.c_direita.store(true);
+                else
+                    comandos.c_direita.store(false);
+            }
+            if (low.find("c_esquerda") != std::string::npos || low.find("esquerda") != std::string::npos) {
+                if (low.find("true") != string::npos || low.find("on") != string::npos || low.find("1") != string::npos)
+                    comandos.c_esquerda.store(true);
+                else
+                    comandos.c_esquerda.store(false);
+            }
+
+            // allow direct setpoints in command topic: x=...,y=...
+            int vx, vy;
+            if (extract_int_arg(s, "x", vx) && extract_int_arg(s, "y", vy)) {
+                // publish setpoint to setpoints topic as convenience (so nav reads it)
+                std::ostringstream sp; sp << "x=" << vx << ",y=" << vy;
+                mqtt.publish("/mina/caminhoes/" + std::to_string(truck_id) + "/setpoints", sp.str());
+            }
+
+            // After interpreting, you may want to reset one-shot commands here or let other tasks clear them.
+            // We'll keep them set (they represent current operator intent) until changed.
+        }
+
+        std::this_thread::sleep_for(30ms);
+    }
+}
+
+
+// ------------------------------
+// THREAD 3: Monitoramento de Falhas
+// - lê buffer de falhas, detecta condições (temp > 95, flags) e publica eventos
+// - atualiza estados.e_defeito
+// ------------------------------
+void MonitoramentoDeFalhas_thread(
+    atomic<bool>& stop_flag,
+    BufferCircular<SensorData>& buf_falhas,
+    MqttClient& mqtt,
+    EstadosCaminhao& estados,
+    int truck_id
+) {
+    while (!stop_flag.load()) {
+        SensorData sd;
+        if (!buf_falhas.try_pop(sd)) {
+            std::this_thread::sleep_for(30ms);
+            continue;
+        }
+
+        bool falha_temp = sd.i_temperatura > 95;
+        bool falha_ele  = sd.i_falha_eletrica;
+        bool falha_hid  = sd.i_falha_hidraulica;
+
+        if (falha_temp || falha_ele || falha_hid) {
+            estados.e_defeito.store(true);
+
+            std::ostringstream ss;
+            ss << "{"
+               << "\"temp\":" << sd.i_temperatura << ","
+               << "\"falha_ele\":" << (falha_ele ? 1 : 0) << ","
+               << "\"falha_hid\":" << (falha_hid ? 1 : 0) << ","
+               << "\"ts\":" << sd.timestamp_ms
+               << "}";
+            mqtt.publish("/mina/caminhoes/" + std::to_string(truck_id) + "/eventos", ss.str());
+        }
+
+        std::this_thread::sleep_for(40ms);
+    }
+}
+
+
+// ------------------------------
+// THREAD 4: Controle de Navegação
+// - Se modo manual: aplica comandos manuais (c_acelera, c_direita, c_esquerda)
+// - Se modo automático: usa controlador simples (P + integrador) e bumpless transfer
+// - Publica atuadores via topic "/mina/caminhoes/<id>/atuadores"
+// ------------------------------
+void ControleDeNavegacao_thread(
+    atomic<bool>& stop_flag,
+    BufferCircular<SensorData>& buf_nav,
+    MqttClient& mqtt,
+    EstadosCaminhao& estados,
+    ComandosCaminhao& comandos,
+    AtuadoresCaminhao& atuadores,
+    int truck_id
+) {
+    const std::string topic_setp = "/mina/caminhoes/" + std::to_string(truck_id) + "/setpoints";
+    int setpoint_x = 500;
+    int setpoint_y = 500;
+
+    double integrador = 0.0;
+    bool controller_enabled = false;
+    int last_o_acel = atuadores.o_aceleracao.load();
+    int last_o_dir  = atuadores.o_direcao.load();
+
+    int period_ms = 100; // 10 Hz
+
+    while (!stop_flag.load()) {
+        // read latest sensor (non-blocking)
+        SensorData sd;
+        buf_nav.try_pop(sd); // if none, sd will be default but we continue
+
+        // check setpoint mqtt
+        auto maybe_sp = mqtt.try_pop_message(topic_setp);
+        if (maybe_sp) {
+            std::string pl = *maybe_sp;
+            int vx, vy;
+            if (extract_int_arg(pl, "x", vx)) setpoint_x = vx;
+            if (extract_int_arg(pl, "y", vy)) setpoint_y = vy;
+        }
+
+        // read states & commands snapshot
+        bool is_auto = estados.e_automatico.load();
+        bool is_def = estados.e_defeito.load();
+
+        if (is_def) {
+            // emergency: zero outputs
+            atuadores.o_aceleracao.store(0);
+            // maintain direction
+            std::ostringstream ss;
+            ss << "{\"o_acel\":0,\"o_dir\":" << atuadores.o_direcao.load()
+               << ",\"e_automatico\":" << (is_auto?1:0) << ",\"e_defeito\":1}";
+            mqtt.publish("/mina/caminhoes/" + std::to_string(truck_id) + "/atuadores", ss.str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));
+            continue;
+        }
+
+        if (!is_auto) {
+            // manual mode: apply operator commands as incremental changes
+            int acel = atuadores.o_aceleracao.load();
+            int dir  = atuadores.o_direcao.load();
+
+            // accelerate while command true
+            if (comandos.c_acelera.load()) acel = std::min(100, acel + 5);
+            else acel = std::max(-100, acel - 2); // natural decay
+
+            if (comandos.c_direita.load()) dir = std::max(-180, dir - 4);
+            if (comandos.c_esquerda.load()) dir = std::min(180, dir + 4);
+
+            atuadores.o_aceleracao.store(acel);
+            atuadores.o_direcao.store(dir);
+
+            // publish actuators state
+            std::ostringstream ss;
+            ss << "{\"o_acel\":" << acel << ",\"o_dir\":" << dir
+               << ",\"e_automatico\":0,\"e_defeito\":0}";
+            mqtt.publish("/mina/caminhoes/" + std::to_string(truck_id) + "/atuadores", ss.str());
+
+            // small sleep
+            std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));
+            continue;
+        }
+
+        // Automatic mode
+        // If controller just enabled, do bumpless transfer: initialize integrator so current accel is maintained
+        if (!controller_enabled) {
+            integrador = static_cast<double>(atuadores.o_aceleracao.load()) * 0.1;
+            controller_enabled = true;
+        }
+
+        // compute control based on last sensor
+        // if no sensor available, keep previous outputs
+        int current_x = sd.i_posicao_x;
+        int current_y = sd.i_posicao_y;
+        int current_ang = sd.i_angulo_x;
+
+        int dx = setpoint_x - current_x;
+        int dy = setpoint_y - current_y;
+        double dist = std::hypot((double)dx, (double)dy);
+
+        // direction controller (P)
+        double desired_ang = 0.0;
+        if (dist > 1.0) {
+            desired_ang = atan2((double)dy, (double)dx) * 180.0 / M_PI;
+            if (desired_ang < 0) desired_ang += 360.0;
+        } else {
+            desired_ang = current_ang;
+        }
+
+        auto wrap180 = [](double a) {
+            while (a > 180.0) a -= 360.0;
+            while (a <= -180.0) a += 360.0;
+            return a;
+        };
+
+        double ang_err = wrap180(desired_ang - current_ang);
+        double Kp_ang = 1.2;
+        int out_dir = current_ang + static_cast<int>(Kp_ang * ang_err);
+        if (out_dir > 180) out_dir -= 360;
+        if (out_dir < -180) out_dir += 360;
+
+        // speed controller (PI) - desired speed proportional to distance
+        double desired_speed = std::min(80.0, dist * 0.25); // arbitrary scaling
+        double current_speed = 0.0; // we don't have direct speed measurement; rely on previous actuator
+        double error_v = desired_speed - current_speed;
+        double Kp_v = 0.8;
+        double Ki_v = 0.05;
+        integrador += error_v * (period_ms / 1000.0);
+        double out_acc = Kp_v * error_v + Ki_v * integrador;
+        int out_acc_i = static_cast<int>(std::round(out_acc));
+        if (out_acc_i > 100) out_acc_i = 100;
+        if (out_acc_i < -100) out_acc_i = -100;
+
+        // apply outputs
+        atuadores.o_aceleracao.store(out_acc_i);
+        atuadores.o_direcao.store(out_dir);
+
+        // publish
+        std::ostringstream ss;
+        ss << "{\"o_acel\":" << out_acc_i << ",\"o_dir\":" << out_dir
+           << ",\"e_automatico\":1,\"e_defeito\":0}";
+        mqtt.publish("/mina/caminhoes/" + std::to_string(truck_id) + "/atuadores", ss.str());
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));
+    }
+}
+
+
+// ------------------------------
+// THREAD 5: Coletor de Dados
+// - Formato (Tabela 3): timestamp_ms, truck_id, estado, pos_x, pos_y, descricao_evento
+// - Também grava CSV detalhado com sensores + atuadores
+// ------------------------------
+void ColetorDeDados_thread(
+    atomic<bool>& stop_flag,
+    BufferCircular<SensorData>& buf_coletor,
+    MqttClient& mqtt,
+    EstadosCaminhao& estados,
+    ComandosCaminhao& comandos,
+    AtuadoresCaminhao& atuadores,
+    int truck_id
+) {
+    std::ofstream fout("logs/logs_caminhao.txt", std::ios::app);
+    std::ofstream fout_detailed("logs/logs_caminhao_detailed.csv", std::ios::app);
+
+    // header for detailed if empty (best-effort)
+    static bool header_written = false;
+    if (!header_written) {
+        fout_detailed << "timestamp_ms,truck_id,pos_x,pos_y,ang,temp,fe,fh,o_acel,o_dir,e_auto,e_defeito\n";
+        header_written = true;
+    }
+
+    while (!stop_flag.load()) {
+        SensorData sd;
+        if (!buf_coletor.try_pop(sd)) {
+            std::this_thread::sleep_for(50ms);
+            continue;
+        }
+
+        bool is_auto = estados.e_automatico.load();
+        bool is_def  = estados.e_defeito.load();
+
+        // description: collect event summary
+        std::ostringstream desc;
+        if (sd.i_falha_eletrica) desc << "FALHA_ELETRICA;";
+        if (sd.i_falha_hidraulica) desc << "FALHA_HIDRAULICA;";
+        if (sd.i_temperatura > 120) desc << "DEFEITO_TEMPERATURA;";
+        if (desc.str().empty()) desc << "OK";
+
+        // Tabela 3 line
+        std::ostringstream line;
+        line << sd.timestamp_ms << ","
+             << truck_id << ","
+             << (is_auto ? "AUTOMATICO" : "MANUAL") << ","
+             << (is_def ? "DEFEITO" : "OK") << ","
+             << sd.i_posicao_x << "," << sd.i_posicao_y << ","
+             << desc.str();
+
+        fout << line.str() << "\n";
+        fout.flush();
+
+        // detailed csv
+        fout_detailed << sd.timestamp_ms << "," << truck_id << ","
+                      << sd.i_posicao_x << "," << sd.i_posicao_y << ","
+                      << sd.i_angulo_x << "," << sd.i_temperatura << ","
+                      << sd.i_falha_eletrica << "," << sd.i_falha_hidraulica << ","
+                      << atuadores.o_aceleracao.load() << "," << atuadores.o_direcao.load() << ","
+                      << (is_auto?1:0) << "," << (is_def?1:0)
+                      << "\n";
+        fout_detailed.flush();
+
+        // publish simplified log
+        std::ostringstream ss;
+        ss << sd.timestamp_ms << "," << truck_id << "," << sd.i_posicao_x << "," << sd.i_posicao_y << "," << sd.i_angulo_x;
+        mqtt.publish("/mina/caminhoes/" + std::to_string(truck_id) + "/logs", ss.str());
+
+        std::this_thread::sleep_for(40ms);
+    }
+
+    fout.close();
+    fout_detailed.close();
+}

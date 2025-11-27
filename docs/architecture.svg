@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" viewBox="0 0 1200 800">
+  <style>
+    .box { fill:#f7f9fb; stroke:#2b6cb0; stroke-width:2; rx:8; }
+    .box-alt { fill:#fff7ed; stroke:#dd6b20; stroke-width:2; rx:8; }
+    .title { font: bold 16px sans-serif; fill:#1a202c }
+    .label { font: 13px sans-serif; fill:#2d3748 }
+    .arrow { stroke:#4a5568; stroke-width:2; marker-end:url(#arrowhead); }
+  </style>
+
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#4a5568" />
+    </marker>
+  </defs>
+
+  <!-- Left column: Sensors + Treatment -->
+  <rect x="40" y="40" width="260" height="80" class="box" />
+  <text x="60" y="70" class="title">Sensores</text>
+  <text x="60" y="92" class="label">i_posicao, i_angulo, i_temperatura,...</text>
+
+  <rect x="40" y="140" width="260" height="100" class="box-alt" />
+  <text x="60" y="170" class="title">Tratamento</text>
+  <text x="60" y="192" class="label">Filtro média móvel (M)</text>
+
+  <!-- Buffer circular central -->
+  <rect x="360" y="110" width="220" height="140" class="box" />
+  <text x="390" y="150" class="title">Buffer Circular</text>
+  <text x="390" y="172" class="label">(200 posições) - leitura por várias tasks</text>
+
+  <!-- Right column: tasks -->
+  <rect x="620" y="40" width="260" height="80" class="box" />
+  <text x="640" y="70" class="title">Lógica de Comando</text>
+  <text x="640" y="92" class="label">Estados e comandos (manual/auto)</text>
+
+  <rect x="620" y="140" width="260" height="80" class="box" />
+  <text x="640" y="170" class="title">Controle de Navegação</text>
+  <text x="640" y="192" class="label">Controle de velocidade e ângulo</text>
+
+  <rect x="620" y="240" width="260" height="80" class="box" />
+  <text x="640" y="270" class="title">Monitoramento de Falhas</text>
+  <text x="640" y="292" class="label">i_temperatura, falhas elétricas/hidráulicas</text>
+
+  <rect x="620" y="340" width="260" height="80" class="box" />
+  <text x="640" y="370" class="title">Coletor de Dados</text>
+  <text x="640" y="392" class="label">Log + timestamps + envio MQTT</text>
+
+  <!-- Bottom: Interfaces and MQTT -->
+  <rect x="40" y="520" width="260" height="80" class="box" />
+  <text x="60" y="550" class="title">Interface Local</text>
+  <text x="60" y="572" class="label">Operador (teclado/GUI)</text>
+
+  <rect x="360" y="520" width="220" height="80" class="box" />
+  <text x="390" y="550" class="title">MQTT Broker</text>
+  <text x="390" y="572" class="label">pub/sub entre componentes</text>
+
+  <rect x="620" y="520" width="260" height="80" class="box" />
+  <text x="640" y="550" class="title">Gestão da Mina</text>
+  <text x="640" y="572" class="label">Mapa, setpoints, monitoramento</text>
+
+  <rect x="960" y="520" width="180" height="80" class="box" />
+  <text x="980" y="550" class="title">Simulação</text>
+  <text x="980" y="572" class="label">Gera sensores (ruído) e defeitos</text>
+
+  <!-- Arrows: Sensors -> Tratamento -> Buffer -->
+  <line x1="200" y1="120" x2="200" y2="140" class="arrow" />
+  <line x1="300" y1="190" x2="360" y2="170" class="arrow" />
+
+  <!-- Buffer -> Lógica / Controle / Coletor / Falhas -->
+  <line x1="580" y1="150" x2="620" y2="150" class="arrow" />
+  <line x1="580" y1="200" x2="620" y2="180" class="arrow" />
+  <line x1="580" y1="260" x2="620" y2="260" class="arrow" />
+  <line x1="580" y1="300" x2="620" y2="380" class="arrow" />
+
+  <!-- Lógica/Coletor -> MQTT -->
+  <line x1="760" y1="100" x2="760" y2="520" class="arrow" />
+  <line x1="760" y1="380" x2="480" y2="560" class="arrow" />
+
+  <!-- Interface Local -> Lógica / Coletor -->
+  <line x1="300" y1="560" x2="620" y2="360" class="arrow" />
+  <line x1="300" y1="560" x2="700" y2="420" class="arrow" />
+
+  <!-- Simulação -> Sensors & MQTT -->
+  <line x1="960" y1="560" x2="300" y2="180" class="arrow" />
+  <line x1="960" y1="560" x2="480" y2="560" class="arrow" />
+
+  <!-- Legend -->
+  <rect x="40" y="640" width="1100" height="110" fill="#fff" stroke="#cbd5e0" rx="6" />
+  <text x="60" y="670" class="label">Legenda:</text>
+  <text x="60" y="690" class="label">- Caixas azuis: módulos embarcados (C++).</text>
+  <text x="60" y="710" class="label">- Caixa laranja: etapas de processamento.</text>
+  <text x="420" y="690" class="label">- MQTT: broker pub/sub para integração com interfaces externas.</text>
+  <text x="420" y="710" class="label">- Simulação/Gestão: podem ser implementadas em Python (Etapa 2).</text>
+
+  <!-- Title -->
+  <text x="360" y="30" class="title">Figura 1 — Arquitetura simplificada do sistema</text>
+</svg>

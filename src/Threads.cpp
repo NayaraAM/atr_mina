@@ -88,8 +88,8 @@ void TratamentoSensores_thread(
     std::normal_distribution<double> noise_temp(0.0, 1.2);  // temperatura
 
     // estado do mundo (0..1000)
-    double px = 500.0;
-    double py = 500.0;
+    double px = 100.0;
+    double py = 100.0;
     double heading = 0.0;   // graus
     double velocity = 0.0;  // unidades (px/s)
     double last_time = static_cast<double>(now_ms());

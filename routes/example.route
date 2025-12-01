@@ -1,7 +1,7 @@
 # Exemplo de rota: cada linha 'x y [speed]'
-100 100 30
-300 120 35
-450 300 40
-600 500 50
-800 700 50
-900 900 40
+# Rota quadrada para a pista atual
+200 150 50
+1100 150 50
+1100 900 50
+200 900 50
+200 150 50   # fecha o quadrado

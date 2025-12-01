@@ -1,3 +1,38 @@
+/*
+ * Arquivo: Threads.cpp
+ * Finalidade:
+ * Este arquivo contém a implementação das cinco funções principais que são
+ * executadas como threads no sistema embarcado do caminhão autônomo. Ele
+ * concentra toda a lógica operacional do sistema, incluindo a simulação da
+ * física e sensores, o processamento de comandos, o controle de navegação
+ * (piloto automático), o monitoramento de falhas e a coleta de dados. As
+ * threads interagem entre si e com o mundo externo através de buffers
+ * circulares e do cliente MQTT, implementando a arquitetura de software do
+ * projeto.
+ *
+ * Resumo das Threads:
+ * 1. TratamentoSensores_thread: Simula a dinâmica física do caminhão (movimento,
+ * aceleração), gera dados de sensores com ruído, aplica filtragem de média
+ * móvel e distribui os dados processados para as outras threads via buffers.
+ * Também trata a injeção de defeitos simulados.
+ * 2. LogicaDeComando_thread: Processa comandos recebidos via MQTT (ex: mudança
+ * de modo auto/manual, rearme de falhas, setpoints diretos) e atualiza o
+ * estado global do caminhão.
+ * 3. MonitoramentoDeFalhas_thread: Analisa os dados dos sensores para detectar
+ * condições críticas (temperatura alta, falhas elétricas/hidráulicas),
+ * atualiza o estado de defeito e publica eventos de alerta/falha via MQTT.
+ * 4. ControleDeNavegacao_thread: Implementa a lógica de controle. No modo manual,
+ * aplica os comandos incrementais do operador. No modo automático, usa um
+ * controlador proporcional (P) para direção e proporcional-integral (PI)
+ * para velocidade para seguir o setpoint atual da rota, garantindo uma
+ * transição suave entre os modos. Publica os valores dos atuadores via MQTT.
+ * 5. ColetorDeDados_thread: Responsável pela telemetria e registro. Lê os dados
+ * do caminhão, grava logs em arquivos de texto e CSV, e publica as informações
+ * de estado, posição e eventos via MQTT para as interfaces externas. Também
+ * atua como um ponto central para receber comandos da interface local e
+ * encaminhá-los para a thread de lógica.
+ */
+
 // src/Threads.cpp
 // Versão "Acadêmica" — Threads do Sistema ATR (Tratamento, Lógica, Falhas, Navegação, Coletor).
 // Requer headers: Threads.h, Autuadores.h, Sensores.h, SensorData.h, BufferCircular.h, MqttClient.h
@@ -72,7 +107,7 @@ void TratamentoSensores_thread(
     BufferCircular<SensorData>& buf_falhas,
     BufferCircular<SensorData>& buf_coletor,
     MqttClient& mqtt,
-    EstadosCaminhao& /*estados*/,         // mantidos aqui por assinatura consistente
+    EstadosCaminhao& /*estados*/,         
     ComandosCaminhao& /*comandos*/,
     AtuadoresCaminhao& atuadores,
     int ordem_media_movel,
@@ -123,11 +158,9 @@ void TratamentoSensores_thread(
             // payload esperado: "eletrica=1" ou "hidraulica=1" ou "clear"
             if (low.find("eletrica") != std::string::npos && (low.find("1") != std::string::npos || low.find("true") != std::string::npos)) {
                 // set flag temporária na próxima amostra
-                // vamos gravar em atuadores (não ideal, mas simples): usar campos de comando não utilizados
-                // Melhor: alterar instância local; aqui definimos variáveis locais
+                // vamos gravar em atuadores (mais simples): usar campos de comando não utilizados
                 // trataremos via sinalização local -> aplicamos diretamente no raw gerado abaixo
             }
-            // a lógica concreta de ativação de defeitos é implementada mais abaixo
         }
         // dinâmica: aceleração proporcional ao comando
         double accel = static_cast<double>(o_acel) * accel_scale;
@@ -273,7 +306,7 @@ void LogicaDeComando_thread(
         buf_logic.pop_wait_for(sd, 50ms);
 
         // Consome comandos vindos do buffer de comandos (inseridos pelo Coletor
-        // quando a interface publica em /.../comandos). Usamos wait curto.
+        // quando a interface publica em /comandos). Usamos wait.
         std::string cmdpl;
         if (buf_cmds.pop_wait_for(cmdpl, 50ms)) {
             std::string pl = cmdpl;
@@ -503,92 +536,112 @@ void ControleDeNavegacao_thread(
                 setpoint_y = last_sd.i_posicao_y;
             }
 
-            // Manual local: use operator commands to adjust actuators incrementally
+            // Lê os valores atuais dos atuadores.
             int acel = atuadores.o_aceleracao.load();
             int dir  = atuadores.o_direcao.load();
 
-            // accelerate when pressed
+            /// Lógica de Aceleração/Frenagem Manual:
+            // Se o comando de aceleração estiver ativo, incrementa a aceleração (até 100).
+            // Caso contrário, decrementa a aceleração (simulando freio motor ou atrito) até -100.
             if (comandos.c_acelera.load()) acel = std::min(100, acel + 6);
             else acel = std::max(-100, acel - 3); // decay when not pressed
 
+            // Lógica de Direção Manual:
+            // Se o comando de direita estiver ativo, decrementa o ângulo (vira à direita, até -180).
+            // Se o comando de esquerda estiver ativo, incrementa o ângulo (vira à esquerda, até 180).
             if (comandos.c_direita.load()) dir = std::max(-180, dir - 5);
             if (comandos.c_esquerda.load()) dir = std::min(180, dir + 5);
 
+            // Atualiza os valores globais dos atuadores com os novos valores calculados.
             atuadores.o_aceleracao.store(acel);
             atuadores.o_direcao.store(dir);
 
-            // publish actuators snapshot
+            // Publica o snapshot atual dos atuadores via MQTT em formato JSON.
             std::ostringstream ss;
             ss << "{\"o_acel\":" << acel << ",\"o_dir\":" << dir
                << ",\"e_automatico\":0,\"e_defeito\":0}";
             mqtt.publish("/mina/caminhoes/" + std::to_string(truck_id) + "/atuadores", ss.str());
 
+            // Aguarda o próximo ciclo de controle.
             std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));
             continue;
         }
 
         // Automatic mode: controller
         if (!controller_enabled) {
-            // bumpless transfer: init integrator to current actuator value scaled
+            // Bumpless transfer: Inicializa o integrador do controlador PI com um valor
+            // proporcional à aceleração atual. Isso evita um "tranco" no integrador
+            // quando o controle automático é ativado, garantindo uma transição suave.
             integrador_v = static_cast<double>(atuadores.o_aceleracao.load()) * 0.1;
             controller_enabled = true;
         }
 
-        // if we don't have sensor reading yet, just sleep and continue
+        // Se não houver leitura do sensor disponível, aguarda e tenta novamente no próximo ciclo.
         if (!have_sd) {
             std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));
             continue;
         }
 
-        // current measurements
+        // Medições atuais do sensor.
         int current_x = sd.i_posicao_x;
         int current_y = sd.i_posicao_y;
         int current_ang = sd.i_angulo_x;
 
+        // Calcula a diferença (erro) de posição entre o setpoint e a posição atual.
         int dx = setpoint_x - current_x;
         int dy = setpoint_y - current_y;
+        // Calcula a distância euclidiana até o setpoint.
         double dist = std::hypot((double)dx, (double)dy);
 
-        // direction control (P)
+        // --- Controlador de Direção (Proporcional - P) ---
         double desired_ang = current_ang;
+        // Se estiver longe do alvo (> 1.0), calcula o ângulo desejado para apontar para ele.
         if (dist > 1.0) {
             desired_ang = atan2((double)dy, (double)dx) * 180.0 / M_PI;
-            if (desired_ang < 0) desired_ang += 360.0;
+            if (desired_ang < 0) desired_ang += 360.0; // Normaliza para 0-359
         }
+        // Função auxiliar para normalizar o erro angular entre -180 e 180 graus.
         auto wrap180 = [](double a) {
             while (a > 180.0) a -= 360.0;
             while (a <= -180.0) a += 360.0;
             return a;
         };
+        // Calcula o erro angular e aplica o ganho proporcional (Kp_ang).
         double ang_err = wrap180(desired_ang - current_ang);
         int out_dir = static_cast<int>(current_ang + std::round(Kp_ang * ang_err));
+        // Normaliza o ângulo de saída para o intervalo -180 a 180.
         if (out_dir > 180) out_dir -= 360;
         if (out_dir < -180) out_dir += 360;
 
-        // speed control (PI) - desired speed proportional to distance
-        double desired_speed = std::min(80.0, dist * 0.4); // scale set higher for visible motion
-        double current_speed = estimated_speed; // estimation from sensor diff
-        double error_v = desired_speed - current_speed;
+        // --- Controlador de Velocidade (Proporcional-Integral - PI) ---
+        // Define a velocidade desejada proporcional à distância até o alvo (máx 80.0).
+        double desired_speed = std::min(80.0, dist * 0.4);
+        double current_speed = estimated_speed; // Velocidade estimada anteriormente
+        double error_v = desired_speed - current_speed; // Erro de velocidade
 
-        // integrator discrete update (anti-windup)
+        // Atualização discreta do integrador com proteção anti-windup (limites).
         integrador_v += error_v * Ki_v * Ts_sec;
         if (integrador_v > INT_MAX) integrador_v = INT_MAX;
         if (integrador_v < INT_MIN) integrador_v = INT_MIN;
 
+        // Calcula a saída de aceleração (comando P + I).
         double out_acc = Kp_v * error_v + integrador_v;
         int out_acc_i = static_cast<int>(std::round(out_acc));
+        // Limita a aceleração de saída ao intervalo -100 a 100.
         if (out_acc_i > 100) out_acc_i = 100;
         if (out_acc_i < -100) out_acc_i = -100;
 
+        // Atualiza os valores globais dos atuadores.
         atuadores.o_aceleracao.store(out_acc_i);
         atuadores.o_direcao.store(out_dir);
 
-        // publish atuadores
+        // Publica os atuadores calculados via MQTT.
         std::ostringstream ss;
         ss << "{\"o_acel\":" << out_acc_i << ",\"o_dir\":" << out_dir
            << ",\"e_automatico\":1,\"e_defeito\":0}";
         mqtt.publish("/mina/caminhoes/" + std::to_string(truck_id) + "/atuadores", ss.str());
 
+        // Aguarda o próximo ciclo de controle.
         std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));
     }
 }
@@ -828,6 +881,6 @@ void ColetorDeDados_thread(
         std::this_thread::sleep_for(40ms);
     }
 
-    fout.close();
+    fout.close(); 
     fout_detailed.close();
 }

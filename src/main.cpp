@@ -1,3 +1,39 @@
+/*
+ * Arquivo: main.cpp
+ * Finalidade:
+ * Este é o ponto de entrada principal do sistema embarcado do caminhão autônomo.
+ * Ele é responsável pela inicialização, configuração e orquestração de todo o
+ * sistema. Suas principais funções incluem:
+ * 1. Configuração do ambiente: Criação de diretórios necessários (logs),
+ * definição de handlers para sinais do sistema (Ctrl+C) e parsing de
+ * argumentos da linha de comando (ID do caminhão, arquivo de rota).
+ * 2. Inicialização de componentes globais: Instanciação dos buffers circulares
+ * para comunicação entre threads, conexão com o broker MQTT e reinicialização
+ * das estruturas globais de estado, comandos e atuadores.
+ * 3. Gerenciamento de rotas: Carrega a rota inicial de um arquivo e inicia uma
+ * thread dedicada (th_route_mgr) para gerenciar a navegação ponto a ponto,
+ * publicando os setpoints sequencialmente via MQTT e permitindo atualizações
+ * dinâmicas da rota em tempo de execução.
+ * 4. Lançamento das threads de trabalho: Inicia as cinco threads principais do
+ * sistema (TratamentoSensores, LogicaDeComando, MonitoramentoDeFalhas,
+ * ControleDeNavegacao, ColetorDeDados), passando a elas as referências
+ * necessárias para os buffers, cliente MQTT e estados globais.
+ * 5. Loop principal e encerramento: Mantém o programa em execução até receber
+ * um sinal de parada, momento em que coordena o encerramento gracioso de
+ * todas as threads e a desconexão do broker MQTT antes de finalizar o processo.
+ *
+ * Bibliotecas Utilizadas:
+ * - iostream, sstream: E/S padrão e manipulação de strings.
+ * - thread, atomic, mutex: Suporte a concorrência e sincronização.
+ * - csignal: Manipulação de sinais do sistema operacional (SIGINT).
+ * - chrono: Funções de tempo e duração.
+ * - filesystem: Operações no sistema de arquivos (criar diretórios).
+ * - cmath: Funções matemáticas (cálculo de distância).
+ * - Cabeçalhos do projeto: Inclui as definições de todas as estruturas e classes
+ * utilizadas (BufferCircular, SensorData, Sensores, Threads, MqttClient,
+ * Autuadores, Route).
+ */
+
 #include <iostream>
 #include <thread>
 #include <atomic>
@@ -39,6 +75,8 @@ int main(int argc, char** argv)
     std::cout << "     Sistema ATR - Caminhão Autônomo     \n";
     std::cout << "=========================================\n";
 
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    
     // --------------------------------------------------------------
     // Flag local de encerramento (passada para as threads por ref)
     // e registro do handler via ponteiro global seguro para o handler.
@@ -226,7 +264,7 @@ int main(int argc, char** argv)
     // tópico: /mina/gerente/add_truck
     // payload esperado: "id=2,route=routes/other.route" ou "2 routes/other.route"
     // --------------------------------------------------------------
-    std::thread th_spawner([&mqtt, &stop_flag, argc, argv]() {
+    /*std::thread th_spawner([&mqtt, &stop_flag, argc, argv]() {
         const std::string topic = "/mina/gerente/add_truck";
         try { mqtt.subscribe_topic(topic); } catch(...) {}
         // path para o executável (argv[0])
@@ -286,7 +324,7 @@ int main(int argc, char** argv)
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
         }
-    });
+    });*/
 
     // --------------------------------------------------------------
     // Thread gerenciadora de rota (publica setpoints MQTT sequencialmente)
@@ -296,6 +334,12 @@ int main(int argc, char** argv)
     // --------------------------------------------------------------
     std::thread th_route_mgr([&stop_flag, &mqtt, &route, truck_id]() {
         if (route.size() == 0) return; // nada a fazer
+
+        const Waypoint &wp = route[0];
+        std::ostringstream ss;
+        ss << "x=" << (int)wp.x << ",y=" << (int)wp.y;
+        mqtt.publish("/mina/caminhoes/.../setpoints", ss.str());
+
 
         // Inscreve nos tópicos de posição e rota para acompanhar progresso e receber atualizações
         try {
@@ -407,7 +451,7 @@ int main(int argc, char** argv)
     if (th_falhas.joinable())     th_falhas.join();
     if (th_nav.joinable())        th_nav.join();
     if (th_coletor.joinable())    th_coletor.join();
-    if (th_spawner.joinable())    th_spawner.join();
+   /* if (th_spawner.joinable())    th_spawner.join();*/
 
     // Tenta desconectar MQTT (se disponível na sua API)
     try {
